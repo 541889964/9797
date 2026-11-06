@@ -164,7 +164,9 @@ static bool testOffsetAt(JNIEnv* env, long long delta, jstring challenge, jstrin
         PowFunc f = (PowFunc)(g_runtimeBase + (uintptr_t)delta);
         long long r1 = f(c, cl, b, bl, (long long)difficulty);
         if (r1 < 0) _exit(3);
-        if (r1 > 1000000000LL) _exit(5);  // 真 PoW nonce 不会超过 1e9
+        // 真实 PoW nonce 极小概率 < 10000
+        if (r1 < 10000LL) _exit(5);
+        if (r1 > 0x7FFFFFFFLL) _exit(5);
         long long r2 = f(c, cl, b, bl, (long long)difficulty);
         if (r2 != r1) _exit(4);
         if (write(fds[1], &r1, sizeof(r1)) != (ssize_t)sizeof(r1)) _exit(1);
@@ -173,7 +175,7 @@ static bool testOffsetAt(JNIEnv* env, long long delta, jstring challenge, jstrin
     close(fds[1]);
     struct pollfd pfd; pfd.fd = fds[0]; pfd.events = POLLIN;
     long long r = -1; bool got = false;
-    if (poll(&pfd, 1, 6000) > 0) {
+    if (poll(&pfd, 1, 8000) > 0) {
         ssize_t n = read(fds[0], &r, sizeof(r));
         if (n == (ssize_t)sizeof(r)) got = true;
     }
@@ -182,7 +184,7 @@ static bool testOffsetAt(JNIEnv* env, long long delta, jstring challenge, jstrin
     env->ReleaseStringUTFChars(challenge, c);
     env->ReleaseStringUTFChars(base, b);
     if (actual) *actual = r;
-    return got && r >= 0;
+    return got && r >= 10000LL;
 }
 
 extern "C" JNIEXPORT jlong JNICALL
