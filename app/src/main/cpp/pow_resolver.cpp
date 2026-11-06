@@ -19,6 +19,7 @@
 #define TAG "PowResolver"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define ANCHOR_SYM_C "Java_com_deepseek_crypto_PowCalculator_nativeCalculateDeepSeekHashV1Pow"
 
 typedef long long (*PowFunc)(const char*, int, const char*, int, long long);
 
@@ -262,9 +263,10 @@ Java_com_powrouter_app_PowResolver_nativeCalculate(JNIEnv* env, jclass, jstring 
                 g_loadBias = (uintptr_t)info.dli_fbase;
                 g_pow = (PowFunc)(g_loadBias + (uintptr_t)delta);
             } else {
-                struct link_map* lm = nullptr;
-                if (dlinfo(g_handle, RTLD_DI_LINKMAP, &lm) == 0 && lm) {
-                    g_loadBias = (uintptr_t)lm->l_addr;
+                Dl_info bi;
+                void* ip = dlsym(g_handle, ANCHOR_SYM_C);
+                if (ip && dladdr(ip, &bi) && bi.dli_fbase) {
+                    g_loadBias = (uintptr_t)bi.dli_fbase;
                     g_pow = (PowFunc)(g_loadBias + (uintptr_t)delta);
                 }
             }
@@ -286,10 +288,11 @@ Java_com_powrouter_app_PowResolver_nativeSelfTest(JNIEnv* env, jclass, jstring s
     void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     env->ReleaseStringUTFChars(soPath, path);
     if (!h) return JNI_FALSE;
-    struct link_map* lm = nullptr;
-    if (dlinfo(h, RTLD_DI_LINKMAP, &lm) != 0 || !lm) { dlclose(h); return JNI_FALSE; }
+    void* ip = dlsym(h, ANCHOR_SYM_C);
+    Dl_info bi;
+    if (!ip || !dladdr(ip, &bi) || !bi.dli_fbase) { dlclose(h); return JNI_FALSE; }
     long long r = 0;
-    bool ok = testCandidate((uintptr_t)lm->l_addr + (uintptr_t)delta, &r);
+    bool ok = testCandidate((uintptr_t)bi.dli_fbase + (uintptr_t)delta, &r);
     dlclose(h);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
