@@ -15,13 +15,21 @@ object PowResolver {
     const val PROBE_BASE = "1700000000_1800000000_"
     const val PROBE_DIFFICULTY = 1L
 
+    fun localSoPath(): String {
+        val src = RootHelper.findLibrscrypto()
+        if (src.isBlank()) return ""
+        return RootHelper.ensureAccessible(src)
+    }
+
     fun resolveCurrent(): ResolveResult {
-        val so = RootHelper.findLibrscrypto()
-        if (so.isBlank()) return ResolveResult(false, -1, "", "未找到 librscrypto.so")
-        val delta = nativeResolve(so, PROBE_CHALLENGE, PROBE_BASE, PROBE_DIFFICULTY)
-        if (delta < 0) return ResolveResult(false, delta, so, "动态偏移解析失败（JNI 真值异常或候选未命中）")
-        val pass = nativeQualityCheck(so, PROBE_CHALLENGE, PROBE_BASE, PROBE_DIFFICULTY, delta)
-        return ResolveResult(true, delta, so, if (pass) "解析成功并通过质检" else "解析成功但质检未通过")
+        val src = RootHelper.findLibrscrypto()
+        if (src.isBlank()) return ResolveResult(false, -1, "", "未找到 librscrypto.so")
+        val local = RootHelper.ensureAccessible(src)
+        if (local.isBlank()) return ResolveResult(false, -1, src, "复制 so 到应用目录失败（dlopen 权限）")
+        val delta = nativeResolve(local, PROBE_CHALLENGE, PROBE_BASE, PROBE_DIFFICULTY)
+        if (delta < 0) return ResolveResult(false, delta, local, "动态偏移解析失败（候选未命中或 so 加载失败）")
+        val pass = nativeQualityCheck(local, PROBE_CHALLENGE, PROBE_BASE, PROBE_DIFFICULTY, delta)
+        return ResolveResult(true, delta, local, if (pass) "解析成功并通过质检" else "解析成功但质检未通过")
     }
 
     fun qualityCheck(so: String, delta: Long): Boolean =
