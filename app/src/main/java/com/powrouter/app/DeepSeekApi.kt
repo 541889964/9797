@@ -126,13 +126,14 @@ object DeepSeekApi {
         try {
             client.newCall(req).execute().use { resp ->
                 if (resp.code == 401) return Result(false, parentId, "Token失效", 0L, ErrorType.AUTH)
-                if (!resp.isSuccessful) return Result(false, parentId, "HTTP ${resp.code}", 0L, ErrorType.NETWORK)
+                if (!resp.isSuccessful) { android.util.Log.w("DS", "HTTP ${resp.code}: " + (resp.body?.string()?.take(300) ?: "")); return Result(false, parentId, "HTTP ${resp.code}", 0L, ErrorType.NETWORK) }
                 val src = resp.body?.source() ?: return Result(false, parentId, "流为空", 0L, ErrorType.NETWORK)
                 while (true) {
                     val line = src.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val raw = line.removePrefix("data:").trim()
                     if (raw == "[DONE]") break
+                    if (!line.startsWith("data:")) { android.util.Log.w("DS", "RAW: " + line.take(300)); continue }
                     try {
                         val o = JSONObject(raw)
                         if (o.has("response_message_id")) { newPid = o.getString("response_message_id"); hasData = true }
