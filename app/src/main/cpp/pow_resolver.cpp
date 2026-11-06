@@ -136,12 +136,20 @@ static bool testCandidate(uintptr_t addr, long long* resultOut) {
         close(fds[0]);
         alarm(3);
         PowFunc f = (PowFunc)addr;
-        const char* ch = "0000000";
+        const char* ch = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const char* base = "1700000000_1800000000_";
-        long long r = f(ch, (int)strlen(ch), base, (int)strlen(base), 1LL);
-        long long r2 = f(ch, (int)strlen(ch), base, (int)strlen(base), 1LL);
-        if (r != r2) _exit(7);
-        if (write(fds[1], &r, sizeof(r)) != (ssize_t)sizeof(r)) _exit(8);
+        // 依次用低难度验证，任一成功且稳定即认为命中
+        long long diffs[3] = {1LL, 2LL, 0LL};
+        long long good = -1;
+        for (int di = 0; di < 3 && good < 0; di++) {
+            long long r = f(ch, (int)strlen(ch), base, (int)strlen(base), diffs[di]);
+            if (r < 0) continue;
+            long long r2 = f(ch, (int)strlen(ch), base, (int)strlen(base), diffs[di]);
+            if (r != r2) continue;
+            good = r;
+        }
+        if (good < 0) _exit(9);
+        if (write(fds[1], &good, sizeof(good)) != (ssize_t)sizeof(good)) _exit(8);
         _exit(0);
     }
     close(fds[1]);
@@ -189,7 +197,7 @@ Java_com_powrouter_app_PowResolver_nativeResolve(JNIEnv* env, jclass, jstring so
     }
 
     std::vector<uint64_t> targets;
-    size_t scanLen = 0x1000;
+    size_t scanLen = 0x4000;
     if (anchorOff + scanLen > v.size) scanLen = v.size - anchorOff;
     collectCallTargets(v.data + anchorOff, scanLen, anchorVaddr, textLo, textHi, targets);
     LOGI("anchor=%llx bias=%llx candidates=%zu", (unsigned long long)anchorVaddr,
