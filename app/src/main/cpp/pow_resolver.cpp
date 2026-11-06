@@ -164,6 +164,7 @@ static bool testOffsetAt(JNIEnv* env, long long delta, jstring challenge, jstrin
         PowFunc f = (PowFunc)(g_runtimeBase + (uintptr_t)delta);
         long long r1 = f(c, cl, b, bl, (long long)difficulty);
         if (r1 < 0) _exit(3);
+        if (r1 > 1000000000LL) _exit(5);  // 真 PoW nonce 不会超过 1e9
         long long r2 = f(c, cl, b, bl, (long long)difficulty);
         if (r2 != r1) _exit(4);
         if (write(fds[1], &r1, sizeof(r1)) != (ssize_t)sizeof(r1)) _exit(1);
