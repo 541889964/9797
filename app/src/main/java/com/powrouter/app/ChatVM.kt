@@ -71,7 +71,14 @@ class ChatVM(app: Application) : AndroidViewModel(app) {
                 delta = r.delta,
                 note = if (r.ok) "${r.msg}  delta=0x${java.lang.Long.toHexString(r.delta)}" else r.msg
             )
-            if (r.ok) { DeepSeekApi.lastDelta = r.delta; DeepSeekApi.lastSoPath = r.soPath }
+            if (r.ok) {
+                val qc = PowResolver.qualityCheck(r.soPath, r.delta)
+                if (qc) { DeepSeekApi.lastDelta = r.delta; DeepSeekApi.lastSoPath = r.soPath }
+                else {
+                    _status.value = _status.value.copy(delta = -1L, note = "质检未通过，已丢弃偏移")
+                    DeepSeekApi.lastDelta = -1L; DeepSeekApi.lastSoPath = ""
+                }
+            }
         }
     }
 
@@ -79,8 +86,8 @@ class ChatVM(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             val st = _status.value
             if (st.delta < 0 || st.soPath.isBlank()) { _status.value = st.copy(note = "请先解析偏移"); return@launch }
-            val ok = PowResolver.nativeSelfTest(st.soPath, st.delta)
-            _status.value = _status.value.copy(note = if (ok) "自检通过 ✔ 偏移可用" else "自检失败 ✘ 请重新解析")
+            val ok = PowResolver.qualityCheck(st.soPath, st.delta)
+            _status.value = _status.value.copy(note = if (ok) "质检通过 ✔ JNI与偏移结果一致" else "质检失败 ✘ 请重新解析")
         }
     }
 

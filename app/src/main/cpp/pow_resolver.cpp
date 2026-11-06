@@ -13,21 +13,25 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <poll.h>
 #include <android/log.h>
 
 #define TAG "PowResolver"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define ANCHOR_SYM_C "Java_com_deepseek_crypto_PowCalculator_nativeCalculateDeepSeekHashV1Pow"
 
+#define ANCHOR_SYM "Java_com_deepseek_crypto_PowCalculator_nativeCalculateDeepSeekHashV1Pow"
+
+typedef jlong (*JniCalcSig)(JNIEnv*, jclass, jstring, jstring, jlong);
 typedef long long (*PowFunc)(const char*, int, const char*, int, long long);
 
-static std::string g_soPath;
 static void* g_handle = nullptr;
-static uintptr_t g_loadBias = 0;
-static PowFunc g_pow = nullptr;
+static std::string g_soPath;
+static uintptr_t g_runtimeBase = 0;
 static long long g_delta = -1;
+static JniCalcSig g_jniCalc = nullptr;
+static PowFunc g_pow = nullptr;
 
 struct ElfView {
     uint8_t* data = nullptr;
@@ -41,7 +45,7 @@ struct ElfView {
 
 static bool mapElf(const char* path, ElfView& v) {
     v.fd = open(path, O_RDONLY);
-    if (v.fd < 0) { LOGE("open fail %s", path); return false; }
+    if (v.fd < 0) return false;
     struct stat st;
     if (fstat(v.fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) { close(v.fd); v.fd = -1; return false; }
     v.size = (size_t)st.st_size;
@@ -77,6 +81,7 @@ static uint64_t findSymbolVaddr(ElfView& v, const char* sym) {
         if (s.sh_type != SHT_DYNSYM && s.sh_type != SHT_SYMTAB) continue;
         Elf64_Sym* syms = (Elf64_Sym*)(v.data + s.sh_offset);
         size_t n = s.sh_size / sizeof(Elf64_Sym);
+        if (s.sh_link >= (uint64_t)v.shnum) continue;
         const char* strtab = (const char*)(v.data + v.sh[s.sh_link].sh_offset);
         for (size_t k = 1; k < n; k++) {
             if (syms[k].st_name == 0 || syms[k].st_value == 0) continue;
@@ -96,6 +101,7 @@ static uint64_t computeLoadBias(ElfView& v) {
 }
 
 static bool fileVaddrToOff(ElfView& v, uint64_t vaddr, uint64_t& off) {
+    if (!v.eh->e_phoff) return false;
     Elf64_Phdr* ph = (Elf64_Phdr*)(v.data + v.eh->e_phoff);
     for (int i = 0; i < v.eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
@@ -110,10 +116,9 @@ static bool fileVaddrToOff(ElfView& v, uint64_t vaddr, uint64_t& off) {
 static void collectCallTargets(const uint8_t* code, size_t len, uint64_t pcVaddr,
                                uint64_t textLo, uint64_t textHi, std::vector<uint64_t>& out) {
     for (size_t i = 0; i + 4 <= len; i += 4) {
-        uint32_t w;
-        memcpy(&w, code + i, 4);
+        uint32_t w; memcpy(&w, code + i, 4);
         uint32_t op = (w >> 26) & 0x3F;
-        if (op != 0x25 && op != 0x05) continue;  // BL / B
+        if (op != 0x25 && op != 0x05) continue;
         int32_t imm = (int32_t)(w & 0x03FFFFFF);
         if (imm & 0x02000000) imm |= (int32_t)0xFC000000;
         int64_t tgt = (int64_t)(pcVaddr + i) + (int64_t)imm * 4;
@@ -127,180 +132,188 @@ static void collectCallTargets(const uint8_t* code, size_t len, uint64_t pcVaddr
     }
 }
 
-static bool testCandidate(uintptr_t addr, long long* resultOut) {
+static bool ensureLoaded(const char* path) {
+    if (g_handle && g_soPath == path && g_jniCalc) return true;
+    if (g_handle) { dlclose(g_handle); g_handle = nullptr; }
+    g_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!g_handle) { LOGE("dlopen fail: %s", dlerror()); return false; }
+    void* fn = dlsym(g_handle, ANCHOR_SYM);
+    if (!fn) { LOGE("dlsym fail"); dlclose(g_handle); g_handle = nullptr; return false; }
+    Dl_info info;
+    if (!dladdr(fn, &info) || !info.dli_fbase) { dlclose(g_handle); g_handle = nullptr; return false; }
+    g_runtimeBase = (uintptr_t)info.dli_fbase;
+    g_jniCalc = (JniCalcSig)fn;
+    g_soPath = path;
+    g_pow = nullptr;
+    return true;
+}
+
+static jlong jniCalc(JNIEnv* env, jstring challenge, jstring base, jlong difficulty) {
+    if (!g_jniCalc) return -1;
+    return g_jniCalc(env, nullptr, challenge, base, difficulty);
+}
+
+static bool testOffsetAt(JNIEnv* env, long long delta, jstring challenge, jstring base,
+                         jlong difficulty, jlong expected, long long* actual) {
+    if (!g_runtimeBase) return false;
+    const char* c = env->GetStringUTFChars(challenge, nullptr);
+    const char* b = env->GetStringUTFChars(base, nullptr);
+    int cl = (int)strlen(c), bl = (int)strlen(b);
     int fds[2];
-    if (pipe(fds) != 0) return false;
+    if (pipe(fds) != 0) { env->ReleaseStringUTFChars(challenge, c); env->ReleaseStringUTFChars(base, b); return false; }
     pid_t pid = fork();
-    if (pid < 0) { close(fds[0]); close(fds[1]); return false; }
+    if (pid < 0) { close(fds[0]); close(fds[1]); env->ReleaseStringUTFChars(challenge, c); env->ReleaseStringUTFChars(base, b); return false; }
     if (pid == 0) {
         close(fds[0]);
-        alarm(3);
-        PowFunc f = (PowFunc)addr;
-        const char* ch = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        const char* base = "1700000000_1800000000_";
-        // 依次用低难度验证，任一成功且稳定即认为命中
-        long long diffs[3] = {1LL, 2LL, 0LL};
-        long long good = -1;
-        for (int di = 0; di < 3 && good < 0; di++) {
-            long long r = f(ch, (int)strlen(ch), base, (int)strlen(base), diffs[di]);
-            if (r < 0) continue;
-            long long r2 = f(ch, (int)strlen(ch), base, (int)strlen(base), diffs[di]);
-            if (r != r2) continue;
-            good = r;
-        }
-        if (good < 0) _exit(9);
-        if (write(fds[1], &good, sizeof(good)) != (ssize_t)sizeof(good)) _exit(8);
+        prctl(PR_SET_DUMPABLE, 0);
+        alarm(2);
+        PowFunc f = (PowFunc)(g_runtimeBase + (uintptr_t)delta);
+        long long r = f(c, cl, b, bl, (long long)difficulty);
+        if (write(fds[1], &r, sizeof(r)) != (ssize_t)sizeof(r)) _exit(1);
         _exit(0);
     }
     close(fds[1]);
     struct pollfd pfd; pfd.fd = fds[0]; pfd.events = POLLIN;
-    bool ok = false;
-    long long val = 0;
-    if (poll(&pfd, 1, 4000) > 0) {
-        ssize_t n = read(fds[0], &val, sizeof(val));
-        if (n == (ssize_t)sizeof(val)) ok = true;
+    long long r = -1; bool got = false;
+    if (poll(&pfd, 1, 2500) > 0) {
+        ssize_t n = read(fds[0], &r, sizeof(r));
+        if (n == (ssize_t)sizeof(r)) got = true;
     }
     close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!ok || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return false;
-    *resultOut = val;
-    return true;
+    int st = 0; waitpid(pid, &st, 0);
+    env->ReleaseStringUTFChars(challenge, c);
+    env->ReleaseStringUTFChars(base, b);
+    if (actual) *actual = r;
+    return got && r == (long long)expected;
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_powrouter_app_PowResolver_nativeResolve(JNIEnv* env, jclass, jstring soPath, jstring anchorSym) {
+Java_com_powrouter_app_PowResolver_nativeResolve(
+        JNIEnv* env, jclass, jstring soPath, jstring challenge, jstring base, jlong difficulty) {
     const char* path = env->GetStringUTFChars(soPath, nullptr);
-    const char* anchor = env->GetStringUTFChars(anchorSym, nullptr);
     long long delta = -1;
-    ElfView v;
-    if (!mapElf(path, v)) { env->ReleaseStringUTFChars(soPath, path); env->ReleaseStringUTFChars(anchorSym, anchor); return -1; }
+    if (!ensureLoaded(path)) {
+        env->ReleaseStringUTFChars(soPath, path);
+        return -1;
+    }
+    jlong truth = jniCalc(env, challenge, base, difficulty);
+    if (truth < 0) {
+        LOGE("JNI truth failed %lld", (long long)truth);
+        env->ReleaseStringUTFChars(soPath, path);
+        return -1;
+    }
+    LOGI("JNI truth=%lld", (long long)truth);
 
-    uint64_t anchorVaddr = findSymbolVaddr(v, anchor);
+    ElfView v;
+    if (!mapElf(path, v)) { env->ReleaseStringUTFChars(soPath, path); return -2; }
+    uint64_t anchorVaddr = findSymbolVaddr(v, ANCHOR_SYM);
     uint64_t bias = computeLoadBias(v);
     Elf64_Shdr* text = findSection(v, ".text");
     if (anchorVaddr == 0 || !text) {
-        LOGE("anchor symbol not found: %s", anchor);
         unmapElf(v);
         env->ReleaseStringUTFChars(soPath, path);
-        env->ReleaseStringUTFChars(anchorSym, anchor);
-        return -1;
+        return -2;
     }
-
     uint64_t textLo = text->sh_addr, textHi = text->sh_addr + text->sh_size;
     uint64_t anchorOff = 0;
     if (!fileVaddrToOff(v, anchorVaddr, anchorOff)) {
         unmapElf(v);
         env->ReleaseStringUTFChars(soPath, path);
-        env->ReleaseStringUTFChars(anchorSym, anchor);
-        return -1;
+        return -2;
     }
-
     std::vector<uint64_t> targets;
     size_t scanLen = 0x4000;
     if (anchorOff + scanLen > v.size) scanLen = v.size - anchorOff;
     collectCallTargets(v.data + anchorOff, scanLen, anchorVaddr, textLo, textHi, targets);
-    LOGI("anchor=%llx bias=%llx candidates=%zu", (unsigned long long)anchorVaddr,
-         (unsigned long long)bias, targets.size());
-
-    if (g_handle == nullptr) {
-        g_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        if (!g_handle) { LOGE("dlopen fail: %s", dlerror()); }
-    }
-    if (g_handle) {
-        void* anchorRuntime = dlsym(g_handle, anchor);
-        if (anchorRuntime) {
-            g_loadBias = (uintptr_t)anchorRuntime - (uintptr_t)(anchorVaddr - bias);
-            for (uint64_t t : targets) {
-                if (t == anchorVaddr) continue;
-                long long r = 0;
-                if (testCandidate(g_loadBias + (uintptr_t)(t - bias), &r)) {
-                    delta = (long long)(t - bias);
-                    LOGI("candidate OK delta=0x%llx result=%lld", delta, r);
-                    break;
-                }
-            }
-        }
-    }
-
-    if (delta < 0) {
-        // 兜底：历史偏移候选，逐个 fork 验证
-        static const long long legacy[] = { 0x19bc0, 0x19c00, 0x19b80, 0x19c40, 0x1a000, 0x1a100 };
-        if (g_handle && g_loadBias) {
-            for (long long d : legacy) {
-                long long r = 0;
-                if (testCandidate(g_loadBias + (uintptr_t)d, &r)) { delta = d; LOGI("legacy hit 0x%llx", d); break; }
-            }
-        }
-    }
-
-    g_soPath = path;
-    g_delta = delta;
-    g_pow = nullptr;
+    LOGI("anchor=%llx bias=%llx candidates=%zu", (unsigned long long)anchorVaddr, (unsigned long long)bias, targets.size());
     unmapElf(v);
+
+    for (uint64_t t : targets) {
+        if (t == anchorVaddr) continue;
+        long long d = (long long)(t - bias);
+        long long actual = 0;
+        if (testOffsetAt(env, d, challenge, base, difficulty, truth, &actual)) {
+            delta = d;
+            LOGI("MATCH delta=0x%llx result=%lld", delta, actual);
+            break;
+        }
+    }
     env->ReleaseStringUTFChars(soPath, path);
-    env->ReleaseStringUTFChars(anchorSym, anchor);
-    return (jlong)delta;
+    if (delta < 0) { g_delta = -1; g_pow = nullptr; return -2; }
+    g_delta = delta;
+    g_pow = (PowFunc)(g_runtimeBase + (uintptr_t)delta);
+    return delta;
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_powrouter_app_PowResolver_nativeCalculate(JNIEnv* env, jclass, jstring soPath, jstring challenge,
-                                                   jstring base, jlong difficulty, jlong delta) {
+Java_com_powrouter_app_PowResolver_nativeCalculate(
+        JNIEnv* env, jclass, jstring soPath, jstring challenge, jstring base,
+        jlong difficulty, jlong delta) {
     const char* path = env->GetStringUTFChars(soPath, nullptr);
-    if (g_handle == nullptr || g_soPath != path || g_delta != delta) {
-        if (g_handle) { dlclose(g_handle); g_handle = nullptr; }
-        g_handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        g_soPath = path;
-        g_delta = delta;
-        g_pow = nullptr;
-        if (g_handle) {
-            Dl_info info;
-            void* any = dlsym(g_handle, "Java_com_deepseek_crypto_PowCalculator_nativeCalculateDeepSeekHashV1Pow");
-            if (!any) {
-                // 用任意导出符号取基址
-                ElfView v;
-                if (mapElf(path, v)) {
-                    uint64_t bias = computeLoadBias(v);
-                    uint64_t a = findSymbolVaddr(v, "Java_com_deepseek_crypto_PowCalculator_nativeCalculateDeepSeekHashV1Pow");
-                    unmapElf(v);
-                    if (a) any = dlsym(g_handle, "JNI_OnLoad");
-                    (void)bias;
-                }
-            }
-            if (any && dladdr(any, &info)) {
-                g_loadBias = (uintptr_t)info.dli_fbase;
-                g_pow = (PowFunc)(g_loadBias + (uintptr_t)delta);
-            } else {
-                Dl_info bi;
-                void* ip = dlsym(g_handle, ANCHOR_SYM_C);
-                if (ip && dladdr(ip, &bi) && bi.dli_fbase) {
-                    g_loadBias = (uintptr_t)bi.dli_fbase;
-                    g_pow = (PowFunc)(g_loadBias + (uintptr_t)delta);
-                }
-            }
-        }
-    }
+    bool ok = ensureLoaded(path);
     env->ReleaseStringUTFChars(soPath, path);
-    if (!g_pow) return -1;
-    const char* c = env->GetStringUTFChars(challenge, nullptr);
-    const char* b = env->GetStringUTFChars(base, nullptr);
-    long long r = g_pow(c, (int)strlen(c), b, (int)strlen(b), (long long)difficulty);
-    env->ReleaseStringUTFChars(challenge, c);
-    env->ReleaseStringUTFChars(base, b);
-    return (jlong)r;
+    if (!ok) return -1;
+    jlong r = jniCalc(env, challenge, base, difficulty);
+    if (r >= 0) return r;
+    if (delta >= 0 && g_runtimeBase) {
+        PowFunc f = (PowFunc)(g_runtimeBase + (uintptr_t)delta);
+        const char* c = env->GetStringUTFChars(challenge, nullptr);
+        const char* b = env->GetStringUTFChars(base, nullptr);
+        r = f(c, (int)strlen(c), b, (int)strlen(b), (long long)difficulty);
+        env->ReleaseStringUTFChars(challenge, c);
+        env->ReleaseStringUTFChars(base, b);
+    }
+    return r;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_powrouter_app_PowResolver_nativeCalculateViaJni(
+        JNIEnv* env, jclass, jstring soPath, jstring challenge, jstring base, jlong difficulty) {
+    const char* path = env->GetStringUTFChars(soPath, nullptr);
+    bool ok = ensureLoaded(path);
+    env->ReleaseStringUTFChars(soPath, path);
+    if (!ok) return -1;
+    return jniCalc(env, challenge, base, difficulty);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_powrouter_app_PowResolver_nativeSelfTest(JNIEnv* env, jclass, jstring soPath, jlong delta) {
+Java_com_powrouter_app_PowResolver_nativeSelfTest(
+        JNIEnv* env, jclass, jstring soPath, jlong delta,
+        jstring challenge, jstring base, jlong difficulty) {
     const char* path = env->GetStringUTFChars(soPath, nullptr);
-    void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    bool ok = ensureLoaded(path);
     env->ReleaseStringUTFChars(soPath, path);
-    if (!h) return JNI_FALSE;
-    void* ip = dlsym(h, ANCHOR_SYM_C);
-    Dl_info bi;
-    if (!ip || !dladdr(ip, &bi) || !bi.dli_fbase) { dlclose(h); return JNI_FALSE; }
-    long long r = 0;
-    bool ok = testCandidate((uintptr_t)bi.dli_fbase + (uintptr_t)delta, &r);
-    dlclose(h);
-    return ok ? JNI_TRUE : JNI_FALSE;
+    if (!ok) return JNI_FALSE;
+    jlong truth = jniCalc(env, challenge, base, difficulty);
+    if (truth < 0) return JNI_FALSE;
+    jlong t2 = jniCalc(env, challenge, base, difficulty);
+    if (t2 != truth) return JNI_FALSE;
+    if (delta >= 0) {
+        long long actual = 0;
+        if (!testOffsetAt(env, delta, challenge, base, difficulty, truth, &actual)) return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_powrouter_app_PowResolver_nativeQualityCheck(
+        JNIEnv* env, jclass, jstring soPath, jstring challenge, jstring base,
+        jlong difficulty, jlong delta) {
+    const char* path = env->GetStringUTFChars(soPath, nullptr);
+    bool ok = ensureLoaded(path);
+    env->ReleaseStringUTFChars(soPath, path);
+    if (!ok) return JNI_FALSE;
+    jlong truth = jniCalc(env, challenge, base, difficulty);
+    if (truth < 0) { LOGE("QC: jni truth failed"); return JNI_FALSE; }
+    jlong t2 = jniCalc(env, challenge, base, difficulty);
+    if (t2 != truth) { LOGE("QC: jni not deterministic %lld vs %lld", (long long)truth, (long long)t2); return JNI_FALSE; }
+    if (delta >= 0) {
+        long long actual = 0;
+        if (!testOffsetAt(env, delta, challenge, base, difficulty, truth, &actual)) {
+            LOGE("QC: offset mismatch actual=%lld truth=%lld", actual, (long long)truth);
+            return JNI_FALSE;
+        }
+    }
+    LOGI("QC OK");
+    return JNI_TRUE;
 }
