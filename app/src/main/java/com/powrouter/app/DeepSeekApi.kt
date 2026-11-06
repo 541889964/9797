@@ -130,7 +130,7 @@ object DeepSeekApi {
                 val src = resp.body?.source() ?: return Result(false, parentId, "流为空", 0L, ErrorType.NETWORK)
                 // Peek at raw body: if it looks like JSON error, parse it
                 val firstLine = try { src.peek().readUtf8Line() ?: "" } catch (e: Exception) { "" }
-                if (firstLine.startsWith("{") && firstLine.contains(""code"") && !firstLine.contains("data:")) {
+                if (firstLine.startsWith("{") && firstLine.contains("\"code\"") && !firstLine.contains("data:")) {
                     val errMsg = try { JSONObject(firstLine).optString("msg", firstLine) } catch (e: Exception) { firstLine }
                     android.util.Log.w("DS", "API error: $errMsg")
                     return Result(false, parentId, "API错误: $errMsg", 0L, ErrorType.OTHER)
