@@ -219,26 +219,26 @@ Java_com_powrouter_app_PowResolver_nativeResolve(
     LOGI("anchor=%llx bias=%llx candidates=%zu", (unsigned long long)anchorVaddr, (unsigned long long)bias, targets.size());
     unmapElf(v);
 
-    // 用真实 challenge 测试每个候选
-    for (uint64_t t : targets) {
-        if (t == anchorVaddr) continue;
-        long long d = (long long)(t - bias);
+    // 优先测试已知历史偏移（0x19bc0 是 SuperRouter 验证过的正确偏移）
+    static const long long legacy[] = { 0x19bc0, 0x19c00, 0x19b80, 0x19c40, 0x1a000, 0x1a100, 0x1a200, 0x19e00, 0x19800 };
+    for (long long d : legacy) {
         long long actual = 0;
         if (testOffsetAt(env, d, challenge, base, difficulty, &actual)) {
             delta = d;
-            LOGI("MATCH delta=0x%llx result=%lld", delta, actual);
+            LOGI("LEGACY MATCH delta=0x%llx result=%lld", delta, actual);
             break;
         }
     }
 
-    // 兜底：已知历史偏移列表（用真实 challenge 测试）
+    // 再扫描调用目标
     if (delta < 0) {
-        static const long long legacy[] = { 0x19bc0, 0x19c00, 0x19b80, 0x19c40, 0x1a000, 0x1a100, 0x1a200, 0x19e00, 0x19800 };
-        for (long long d : legacy) {
+        for (uint64_t t : targets) {
+            if (t == anchorVaddr) continue;
+            long long d = (long long)(t - bias);
             long long actual = 0;
             if (testOffsetAt(env, d, challenge, base, difficulty, &actual)) {
                 delta = d;
-                LOGI("LEGACY MATCH delta=0x%llx result=%lld", delta, actual);
+                LOGI("MATCH delta=0x%llx result=%lld", delta, actual);
                 break;
             }
         }
