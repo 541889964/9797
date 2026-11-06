@@ -51,7 +51,8 @@ object DeepSeekApi {
         } catch (_: Exception) {}
     }
 
-    fun solvePow(token: String, smid: String): String? = try {
+    fun solvePow(token: String, smid: String): String? {
+        return try {
         val h = headers(token, smid)
         val req = Request.Builder().url("$BASE/api/v0/chat/create_pow_challenge")
             .apply { h.forEach { (k, v) -> header(k, v) } }
@@ -87,8 +88,10 @@ object DeepSeekApi {
         }.toString()
         java.util.Base64.getEncoder().encodeToString(payload.toByteArray())
     } catch (e: Exception) { null }
+    }
 
-    fun uploadImage(token: String, smid: String, filePath: String): String? = try {
+    fun uploadImage(token: String, smid: String, filePath: String): String? {
+        return try {
         val f = File(filePath); if (!f.exists()) return null
         val h = headers(token, smid).filterKeys { it != "Content-Type" }
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -100,6 +103,7 @@ object DeepSeekApi {
             if (o.has("data")) o.getJSONObject("data").getString("file_id") else null
         }
     } catch (e: Exception) { null }
+    }
 
     data class Result(val success: Boolean, val newPid: String?, val error: String, val usage: Long = 0L, val errorType: ErrorType = ErrorType.NONE)
 
