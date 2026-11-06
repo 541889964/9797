@@ -128,6 +128,13 @@ object DeepSeekApi {
                 if (resp.code == 401) return Result(false, parentId, "Token失效", 0L, ErrorType.AUTH)
                 if (!resp.isSuccessful) { android.util.Log.w("DS", "HTTP ${resp.code}: " + (resp.body?.string()?.take(300) ?: "")); return Result(false, parentId, "HTTP ${resp.code}", 0L, ErrorType.NETWORK) }
                 val src = resp.body?.source() ?: return Result(false, parentId, "流为空", 0L, ErrorType.NETWORK)
+                // Peek at raw body: if it looks like JSON error, parse it
+                val firstLine = try { src.peek().readUtf8Line() ?: "" } catch (e: Exception) { "" }
+                if (firstLine.startsWith("{") && firstLine.contains(""code"") && !firstLine.contains("data:")) {
+                    val errMsg = try { JSONObject(firstLine).optString("msg", firstLine) } catch (e: Exception) { firstLine }
+                    android.util.Log.w("DS", "API error: $errMsg")
+                    return Result(false, parentId, "API错误: $errMsg", 0L, ErrorType.OTHER)
+                }
                 while (true) {
                     val line = src.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue

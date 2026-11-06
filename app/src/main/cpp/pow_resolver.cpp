@@ -212,11 +212,22 @@ Java_com_powrouter_app_PowResolver_nativeResolve(
         env->ReleaseStringUTFChars(soPath, path);
         return -2;
     }
+    LOGI("anchor=%llx bias=%llx", (unsigned long long)anchorVaddr, (unsigned long long)bias);
+    // 版本指纹：已知 0x18e40 版本的 so，0x19bc0 就是正确偏移（SuperRouter 验证过）
+    if (anchorVaddr == 0x18e40ULL) {
+        unmapElf(v);
+        env->ReleaseStringUTFChars(soPath, path);
+        g_delta = 0x19bc0LL;
+        g_pow = (PowFunc)(g_runtimeBase + (uintptr_t)g_delta);
+        LOGI("version fingerprint match, delta=0x19bc0");
+        return g_delta;
+    }
+
     std::vector<uint64_t> targets;
     size_t scanLen = 0x4000;
     if (anchorOff + scanLen > v.size) scanLen = v.size - anchorOff;
     collectCallTargets(v.data + anchorOff, scanLen, anchorVaddr, textLo, textHi, targets);
-    LOGI("anchor=%llx bias=%llx candidates=%zu", (unsigned long long)anchorVaddr, (unsigned long long)bias, targets.size());
+    LOGI("candidates=%zu", targets.size());
     unmapElf(v);
 
     // 优先测试已知历史偏移（0x19bc0 是 SuperRouter 验证过的正确偏移）
