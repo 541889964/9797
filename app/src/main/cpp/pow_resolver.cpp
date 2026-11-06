@@ -215,6 +215,15 @@ Java_com_powrouter_app_PowResolver_nativeResolve(
         return -2;
     }
     LOGI("anchor=%llx bias=%llx", (unsigned long long)anchorVaddr, (unsigned long long)bias);
+    // 指纹查表：已知版本 (anchor 0x18e40, bias 0) → 已验证偏移 0x19bc0
+    if (anchorVaddr == 0x18e40ULL && bias == 0ULL) {
+        unmapElf(v);
+        env->ReleaseStringUTFChars(soPath, path);
+        g_delta = 0x19bc0LL;
+        g_pow = (PowFunc)(g_runtimeBase + (uintptr_t)g_delta);
+        LOGI("fingerprint 0x18e40 -> delta=0x19bc0");
+        return g_delta;
+    }
     std::vector<uint64_t> targets;
     size_t scanLen = 0x4000;
     if (anchorOff + scanLen > v.size) scanLen = v.size - anchorOff;
